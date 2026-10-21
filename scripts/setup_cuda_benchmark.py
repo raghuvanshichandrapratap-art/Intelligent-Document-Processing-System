@@ -91,7 +91,21 @@ def ensure_torch_sees_cuda(cuda_version):
         return
 
     index_url = f"https://download.pytorch.org/whl/cu{channel.replace('.', '')}"
-    run(["uv", "pip", "install", "torch", "--index-url", index_url])
+    # --reinstall-package is required: `uv pip install torch` alone is a no-op
+    # when any torch build is already installed (even a CPU-only one), since
+    # the bare "torch" requirement is already satisfied regardless of which
+    # index it originally came from.
+    run(["uv", "pip", "install", "torch", "--index-url", index_url, "--reinstall-package", "torch"])
+
+    ok, stdout, stderr = run_python("import torch; print(torch.cuda.is_available())")
+
+    if not (ok and stdout == "True"):
+        print(
+            f"torch still doesn't see the GPU after installing from the cu{channel.replace('.', '')} "
+            "channel. This usually means the NVIDIA driver is older than that wheel expects — "
+            "check `nvidia-smi` and try --cuda-version with a lower number, or install torch "
+            "manually from https://pytorch.org/get-started/locally/"
+        )
 
 
 def install_onnxruntime_gpu():
