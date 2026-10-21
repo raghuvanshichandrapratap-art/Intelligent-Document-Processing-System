@@ -7,6 +7,7 @@ import statistics
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -74,6 +75,21 @@ TABLE_COLUMNS = [
     "accuracy_pct",
     "error_rate_pct",
     "speedup_vs_cpu",
+]
+
+CONCURRENCY_TABLE_COLUMNS = [
+    "model",
+    "device",
+    "concurrency",
+    "status",
+    "p50_ms",
+    "p95_ms",
+    "p99_ms",
+    "throughput_req_s",
+    "peak_mem_mb",
+    "gpu_mem_mb",
+    "gpu_util_pct",
+    "error_rate_pct",
 ]
 
 
@@ -485,6 +501,102 @@ def run_model_device_benchmark(
     }
 
 
+def run_concurrent_load_benchmark(
+    model_name,
+    device,
+    process_fn,
+    sample_images,
+    concurrency_levels,
+    requests_per_level,
+    memory_sampling,
+    memory_sampling_interval_seconds,
+):
+    # A single already-loaded model instance is shared across worker threads —
+    # this mirrors a typical GPU-serving setup (one model behind a server
+    # handling concurrent requests), not N independent processes each holding
+    # their own model copy, which would multiply VRAM use by concurrency level.
+    load_model(model_name, device)
+    process_fn(sample_images[0], model_name, device=device)
+
+    gpu_monitor = GpuMonitor(device) if device != "cpu" else None
+    process = psutil.Process()
+    results = []
+
+    for concurrency in concurrency_levels:
+        images_for_run = [sample_images[i % len(sample_images)] for i in range(requests_per_level)]
+        latency_samples = []
+        task_errors = []
+
+        process.cpu_percent(interval=None)
+        sampler = RssSampler(process, memory_sampling_interval_seconds) if memory_sampling == "threaded" else None
+        gpu_sampler = (
+            GpuSampler(gpu_monitor, memory_sampling_interval_seconds)
+            if gpu_monitor is not None and gpu_monitor.error is None and memory_sampling == "threaded"
+            else None
+        )
+
+        def run_one(image_path):
+            started_at = time.perf_counter()
+            process_fn(image_path, model_name, device=device)
+            return time.perf_counter() - started_at
+
+        wall_started_at = time.perf_counter()
+        with contextlib.ExitStack() as stack:
+            if sampler:
+                stack.enter_context(sampler)
+            if gpu_sampler:
+                stack.enter_context(gpu_sampler)
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                futures = [executor.submit(run_one, image_path) for image_path in images_for_run]
+                for future in as_completed(futures):
+                    try:
+                        latency_samples.append(future.result())
+                    except Exception as error:
+                        task_errors.append(str(error))
+        wall_elapsed_seconds = time.perf_counter() - wall_started_at
+        cpu_percent = process.cpu_percent(interval=None)
+
+        latency_stats = compute_latency_statistics(latency_samples)
+        throughput = (
+            round(len(latency_samples) / wall_elapsed_seconds, 3) if wall_elapsed_seconds > 0 else None
+        )
+
+        gpu_metrics = None
+        if device != "cpu":
+            gpu_metrics = {
+                "peak_memory_mb": round(gpu_sampler.peak_memory_bytes / 1e6, 2) if gpu_sampler else None,
+                "utilization_percent_mean": (
+                    round(statistics.mean(gpu_sampler.utilization_samples), 2)
+                    if gpu_sampler and gpu_sampler.utilization_samples
+                    else None
+                ),
+                "unavailable_reason": gpu_monitor.error if gpu_monitor is not None else None,
+            }
+
+        results.append(
+            {
+                "model": model_name,
+                "device": device,
+                "concurrency": concurrency,
+                "status": "ok" if latency_samples else "error",
+                "requests_attempted": requests_per_level,
+                "requests_failed": len(task_errors),
+                "error_rate_percent": round(len(task_errors) / requests_per_level * 100, 2),
+                "wall_clock_seconds": round(wall_elapsed_seconds, 4),
+                "throughput_requests_per_second": throughput,
+                "latency_under_load": latency_stats,
+                "peak_rss_mb": round(sampler.peak / 1e6, 2) if sampler else None,
+                "gpu": gpu_metrics,
+                "cpu_percent_mean": cpu_percent,
+            }
+        )
+
+    if gpu_monitor is not None:
+        gpu_monitor.close()
+
+    return results
+
+
 def run_benchmark_for_document(
     document_name,
     models,
@@ -530,6 +642,45 @@ def run_benchmark_for_document(
             )
 
     return results, sample_images
+
+
+def run_concurrency_benchmark_for_document(
+    document_name,
+    sequential_results,
+    sample_images,
+    concurrency_levels,
+    concurrent_requests,
+    memory_sampling,
+    memory_sampling_interval_ms,
+):
+    _, _, process_fn = DOCUMENT_PROCESSORS[document_name]
+    testable = [result for result in sequential_results if result.get("status") in {"ok", "inconclusive"}]
+    concurrent_results = []
+
+    for result in testable:
+        model_name, device = result["model"], result["device"]
+        print(
+            f"[{document_name}] concurrency test: {model_name} on {device} "
+            f"(levels={concurrency_levels}, {concurrent_requests} requests/level)",
+            file=sys.stderr,
+        )
+        try:
+            concurrent_results.extend(
+                run_concurrent_load_benchmark(
+                    model_name,
+                    device,
+                    process_fn,
+                    sample_images,
+                    concurrency_levels,
+                    concurrent_requests,
+                    memory_sampling,
+                    memory_sampling_interval_ms / 1000,
+                )
+            )
+        except Exception as error:
+            print(f"  concurrency test failed for {model_name}/{device}: {error}", file=sys.stderr)
+
+    return concurrent_results
 
 
 def add_speedup_vs_cpu(results):
@@ -609,6 +760,57 @@ def render_markdown_table(results):
     return "\n".join([header_line, separator_line, *body_lines])
 
 
+def concurrency_result_to_row(result):
+    latency = result.get("latency_under_load") or {}
+    gpu = result.get("gpu") or {}
+
+    return {
+        "model": result["model"],
+        "device": result["device"],
+        "concurrency": str(result["concurrency"]),
+        "status": result["status"],
+        "p50_ms": _format_ms(latency.get("p50_seconds")),
+        "p95_ms": _format_ms(latency.get("p95_seconds")),
+        "p99_ms": _format_ms(latency.get("p99_seconds")),
+        "throughput_req_s": _format_number(result.get("throughput_requests_per_second")),
+        "peak_mem_mb": _format_number(result.get("peak_rss_mb")),
+        "gpu_mem_mb": _format_number(gpu.get("peak_memory_mb")),
+        "gpu_util_pct": _format_number(gpu.get("utilization_percent_mean")),
+        "error_rate_pct": _format_number(result.get("error_rate_percent")),
+    }
+
+
+def render_concurrency_console_table(results):
+    rows = [concurrency_result_to_row(result) for result in results]
+
+    if not rows:
+        return "(no results)"
+
+    widths = {
+        column: max(len(column), *(len(row[column]) for row in rows))
+        for column in CONCURRENCY_TABLE_COLUMNS
+    }
+    header_line = "  ".join(column.ljust(widths[column]) for column in CONCURRENCY_TABLE_COLUMNS)
+    separator = "  ".join("-" * widths[column] for column in CONCURRENCY_TABLE_COLUMNS)
+    body_lines = [
+        "  ".join(row[column].ljust(widths[column]) for column in CONCURRENCY_TABLE_COLUMNS)
+        for row in rows
+    ]
+
+    return "\n".join([header_line, separator, *body_lines])
+
+
+def render_concurrency_markdown_table(results):
+    rows = [concurrency_result_to_row(result) for result in results]
+    header_line = "| " + " | ".join(CONCURRENCY_TABLE_COLUMNS) + " |"
+    separator_line = "| " + " | ".join("---" for _ in CONCURRENCY_TABLE_COLUMNS) + " |"
+    body_lines = [
+        "| " + " | ".join(row[column] for column in CONCURRENCY_TABLE_COLUMNS) + " |" for row in rows
+    ]
+
+    return "\n".join([header_line, separator_line, *body_lines])
+
+
 def machine_info():
     info = {"mps_available": mps_is_available(), "cuda_available": cuda_is_available()}
 
@@ -639,6 +841,13 @@ def write_markdown_report(results, output_folder, document_name, run_label):
     return output_path
 
 
+def write_concurrency_markdown_report(results, output_folder, document_name, run_label):
+    output_folder.mkdir(parents=True, exist_ok=True)
+    output_path = output_folder / f"{document_name}_{run_label}_concurrency.md"
+    output_path.write_text(render_concurrency_markdown_table(results), encoding="utf-8")
+    return output_path
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="python testing/benchmark.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -660,6 +869,17 @@ def build_parser():
         "--compare-accuracy", dest="compare_accuracy", action="store_true", default=True
     )
     batch_parser.add_argument("--no-compare-accuracy", dest="compare_accuracy", action="store_false")
+    batch_parser.add_argument(
+        "--test-concurrency",
+        action="store_true",
+        default=False,
+        help=(
+            "Also load-test each model+device that succeeded above with concurrent "
+            "requests against one shared model instance (not one instance per worker)."
+        ),
+    )
+    batch_parser.add_argument("--concurrency-levels", default="1,2,4,8")
+    batch_parser.add_argument("--concurrent-requests", type=int, default=16)
 
     return parser
 
@@ -708,6 +928,25 @@ def run_batch_command(arguments):
             "results": results,
         }
 
+        concurrent_results = []
+
+        if arguments.test_concurrency:
+            concurrency_levels = [
+                int(level.strip()) for level in arguments.concurrency_levels.split(",") if level.strip()
+            ]
+            concurrent_results = run_concurrency_benchmark_for_document(
+                document_name,
+                results,
+                sample_images,
+                concurrency_levels,
+                arguments.concurrent_requests,
+                arguments.memory_sampling,
+                arguments.memory_sampling_interval_ms,
+            )
+            report["concurrency_levels_tested"] = concurrency_levels
+            report["concurrent_requests_per_level"] = arguments.concurrent_requests
+            report["concurrent_results"] = concurrent_results
+
         if arguments.output_format in {"json", "both"}:
             json_path = write_json_report(report, benchmarks_outputs_folder, run_label)
             print(f"Wrote {json_path}")
@@ -718,9 +957,20 @@ def run_batch_command(arguments):
             )
             print(f"Wrote {markdown_path}")
 
+            if concurrent_results:
+                concurrency_markdown_path = write_concurrency_markdown_report(
+                    concurrent_results, benchmarks_outputs_folder, document_name, run_label
+                )
+                print(f"Wrote {concurrency_markdown_path}")
+
         print(f"\n=== {document_name} ===")
         print(render_console_table(results))
         print()
+
+        if concurrent_results:
+            print(f"=== {document_name} (concurrent load) ===")
+            print(render_concurrency_console_table(concurrent_results))
+            print()
 
 
 def main(argv=None):
