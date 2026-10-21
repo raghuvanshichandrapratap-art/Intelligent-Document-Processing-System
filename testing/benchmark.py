@@ -30,6 +30,7 @@ from Backend.processors.image_processor import (
     get_paddle_ocr,
     get_rapidocr_reader,
     check_tesseract_available,
+    release_ocr_model,
 )
 from testing.reporting import outputs_folder
 from testing.testing import (
@@ -180,10 +181,16 @@ def detect_inconclusive(model_name, device, loaded_model, warmup_output):
             )
         if device == "cuda":
             providers = get_rapidocr_active_providers(loaded_model)
-            if providers is not None and "CUDAExecutionProvider" not in providers:
+            if providers is None:
                 return True, (
-                    "CUDAExecutionProvider not active in the onnxruntime session "
-                    "(likely onnxruntime-gpu is not installed or CUDA is unavailable)"
+                    "could not verify active onnxruntime providers (introspection failed) — "
+                    "treating as unverified rather than assuming CUDA is active"
+                )
+            if "CUDAExecutionProvider" not in providers:
+                return True, (
+                    "CUDAExecutionProvider not active in the onnxruntime session — check the console "
+                    "output for a 'No registered plugin EP device found for CUDAExecutionProvider' "
+                    "warning, which means it silently fell back to CPU for this model"
                 )
         return False, ""
 
@@ -640,6 +647,10 @@ def run_benchmark_for_document(
                     compare_accuracy,
                 )
             )
+            # Release this model's memory before loading the next one — without
+            # this, every model tested stays resident for the rest of the
+            # process, and memory accumulates across the whole batch run.
+            release_ocr_model(model_name, device)
 
     return results, sample_images
 
@@ -679,6 +690,8 @@ def run_concurrency_benchmark_for_document(
             )
         except Exception as error:
             print(f"  concurrency test failed for {model_name}/{device}: {error}", file=sys.stderr)
+        finally:
+            release_ocr_model(model_name, device)
 
     return concurrent_results
 

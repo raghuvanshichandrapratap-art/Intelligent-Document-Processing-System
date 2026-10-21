@@ -167,6 +167,36 @@ def get_available_ocr_models():
     return models
 
 
+def release_ocr_model(model_name, device="cpu"):
+    # Drops a cached model instance so its memory can be freed. Each cache
+    # holds a full model (hundreds of MB to several GB for easyocr/doctr/
+    # paddleocr), so benchmarking many models back-to-back in one process
+    # without releasing them accumulates memory across the whole run.
+    if model_name == "easyocr":
+        easyocr_readers.pop(device, None)
+    elif model_name == "doctr":
+        doctr_predictors.pop(device, None)
+    elif model_name == "rapidocr":
+        rapidocr_readers.pop(device, None)
+    elif model_name == "paddleocr":
+        for key in [key for key in paddle_ocr if key[1] == device]:
+            paddle_ocr.pop(key, None)
+
+    import gc
+
+    gc.collect()
+
+    try:
+        import torch
+
+        if device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif device == "mps" and torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
 def read_image_for_processing(image_path):
     try:
         import cv2
