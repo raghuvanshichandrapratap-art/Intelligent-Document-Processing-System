@@ -72,6 +72,7 @@ TABLE_COLUMNS = [
     "gpu_mem_mb",
     "gpu_util_pct",
     "accuracy_pct",
+    "error_rate_pct",
     "speedup_vs_cpu",
 ]
 
@@ -377,9 +378,14 @@ def run_model_device_benchmark(
     gpu_peaks_mb = []
     gpu_utilization_percents = []
 
-    try:
-        for _ in range(repeats):
-            for image_path in sample_images:
+    image_errors = []
+    attempted_count = 0
+
+    for _ in range(repeats):
+        for image_path in sample_images:
+            attempted_count += 1
+
+            try:
                 rss_before = process.memory_info().rss
                 sampler = (
                     RssSampler(process, memory_sampling_interval_seconds)
@@ -419,19 +425,24 @@ def run_model_device_benchmark(
                     if ground_truth:
                         comparison = compare_with_ground_truth(result["extracted_data"], ground_truth)
                         accuracy_samples.append(comparison["accuracy_percent"])
-    except Exception as error:
-        if gpu_monitor is not None:
-            gpu_monitor.close()
+            except Exception as error:
+                # One bad image (e.g. a deliberately degraded test sample) shouldn't
+                # throw away every other successful measurement in this run.
+                message = f"{image_path.name}: {error}"
+                image_errors.append(message)
+                print(f"  [{model_name}/{device}] image failed, continuing: {message}", file=sys.stderr)
+
+    if gpu_monitor is not None:
+        gpu_monitor.close()
+
+    if not latency_samples:
         return {
             "model": model_name,
             "device": device,
             "status": "error",
-            "reason": str(error),
+            "reason": f"all {attempted_count} attempts failed: {image_errors[0] if image_errors else 'unknown error'}",
             "model_load_seconds": model_load_seconds,
         }
-
-    if gpu_monitor is not None:
-        gpu_monitor.close()
 
     latency_stats = compute_latency_statistics(latency_samples)
     total_elapsed_seconds = sum(latency_samples)
@@ -467,6 +478,10 @@ def run_model_device_benchmark(
         "cpu_percent_mean": round(statistics.mean(cpu_percents), 2) if cpu_percents else None,
         "accuracy_percent_mean": round(statistics.mean(accuracy_samples), 2) if accuracy_samples else None,
         "sample_count": len(sample_images),
+        "images_attempted": attempted_count,
+        "images_failed": len(image_errors),
+        "error_rate_percent": round(len(image_errors) / attempted_count * 100, 2) if attempted_count else 0,
+        "image_errors": image_errors[:5],
     }
 
 
@@ -562,6 +577,7 @@ def result_to_row(result):
         "gpu_mem_mb": _format_number(gpu.get("peak_memory_mb_mean")),
         "gpu_util_pct": _format_number(gpu.get("utilization_percent_mean")),
         "accuracy_pct": _format_number(result.get("accuracy_percent_mean")),
+        "error_rate_pct": _format_number(result.get("error_rate_percent")),
         "speedup_vs_cpu": _format_number(result.get("speedup_vs_cpu"), suffix="x"),
     }
 
