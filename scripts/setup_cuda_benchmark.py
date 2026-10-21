@@ -40,6 +40,17 @@ def run(command, check=True):
     return subprocess.run(command, cwd=PROJECT_FOLDER, check=check)
 
 
+def run_pip(args, check=True):
+    # `uv pip` auto-discovers .venv from the current directory in most cases,
+    # but some environments (confirmed on Kaggle) pre-set VIRTUAL_ENV in the
+    # kernel's startup environment, which uv prioritizes over cwd-based
+    # discovery — silently redirecting installs to a system Python instead of
+    # this project's .venv. sys.executable is reliable here regardless: `uv
+    # run` already resolved it to .venv's interpreter before this script
+    # started, so passing it explicitly removes any ambiguity.
+    return run(["uv", "pip", *args, "--python", sys.executable], check=check)
+
+
 def run_python(code):
     result = subprocess.run(
         [sys.executable, "-c", code],
@@ -97,8 +108,8 @@ def ensure_torch_sees_cuda(cuda_version):
     # index it originally came from. --refresh-package additionally bypasses
     # uv's cache, since --reinstall-package alone can still be served a stale
     # cached wheel from an earlier (e.g. interrupted) install attempt.
-    run([
-        "uv", "pip", "install", "torch",
+    run_pip([
+        "install", "torch",
         "--index-url", index_url,
         "--reinstall-package", "torch",
         "--refresh-package", "torch",
@@ -117,8 +128,8 @@ def ensure_torch_sees_cuda(cuda_version):
 
 def install_onnxruntime_gpu():
     print("\n=== Installing onnxruntime-gpu (for RapidOCR on CUDA) ===")
-    run(["uv", "pip", "uninstall", "onnxruntime"], check=False)
-    run(["uv", "pip", "install", "onnxruntime-gpu", "--refresh-package", "onnxruntime-gpu"])
+    run_pip(["uninstall", "onnxruntime"], check=False)
+    run_pip(["install", "onnxruntime-gpu", "--refresh-package", "onnxruntime-gpu"])
 
 
 def install_paddlepaddle_gpu(cuda_version):
@@ -132,17 +143,17 @@ def install_paddlepaddle_gpu(cuda_version):
         )
         return
 
-    run(["uv", "pip", "uninstall", "paddlepaddle"], check=False)
-    run(["uv", "pip", "uninstall", "paddlepaddle-gpu"], check=False)
+    run_pip(["uninstall", "paddlepaddle"], check=False)
+    run_pip(["uninstall", "paddlepaddle-gpu"], check=False)
     index_url = f"https://www.paddlepaddle.org.cn/packages/stable/cu{channel.replace('.', '')}/"
 
     # --refresh-package is required here, confirmed by hitting it directly: uv
     # can silently serve a stale cached wheel even across uninstall/reinstall
     # cycles, which looks identical to a genuinely CPU-only build (same
     # version, same filename) until you inspect paddle.version.show().
-    result = run(
+    result = run_pip(
         [
-            "uv", "pip", "install", f"paddlepaddle-gpu=={PADDLE_VERSION}",
+            "install", f"paddlepaddle-gpu=={PADDLE_VERSION}",
             "-i", index_url,
             "--refresh-package", "paddlepaddle-gpu",
         ],
@@ -151,7 +162,7 @@ def install_paddlepaddle_gpu(cuda_version):
 
     if result.returncode != 0:
         print(f"paddlepaddle-gpu=={PADDLE_VERSION} isn't available on that channel yet, trying latest.")
-        run(["uv", "pip", "install", "paddlepaddle-gpu", "-i", index_url, "--refresh-package", "paddlepaddle-gpu"])
+        run_pip(["install", "paddlepaddle-gpu", "-i", index_url, "--refresh-package", "paddlepaddle-gpu"])
 
 
 def verify_setup():
