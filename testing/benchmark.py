@@ -172,6 +172,22 @@ def detect_inconclusive(model_name, device, loaded_model, warmup_output):
             return True, f"docTR resolved to device={actual_device_type!r} instead of {device!r}"
         return False, ""
 
+    if model_name == "paddleocr" and device == "cuda":
+        try:
+            import paddle
+
+            if not paddle.is_compiled_with_cuda():
+                return True, (
+                    "paddle.is_compiled_with_cuda() is False — the installed paddlepaddle-gpu "
+                    "build has no CUDA support compiled in, so PaddleOCR silently ran on CPU "
+                    "despite device='gpu' being requested (confirmed reproducible: this can "
+                    "happen even with a correctly-named GPU wheel if the actual served file "
+                    "isn't CUDA-compiled for this platform/network path)"
+                )
+        except Exception as error:
+            return True, f"could not verify paddle's CUDA compilation status: {error}"
+        return False, ""
+
     if model_name == "rapidocr":
         if device == "mps" and "E5RT" in warmup_output:
             return True, (
