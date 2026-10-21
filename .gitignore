@@ -34,6 +34,9 @@ uploads/**
 !uploads/**/.gitkeep
 outputs 2/
 validation_test_report*.json
+testing/test-outputs/**
+!testing/test-outputs/**/
+!testing/test-outputs/**/.gitkeep
 
 # Local understanding/reference documents
 docs/*.pdf

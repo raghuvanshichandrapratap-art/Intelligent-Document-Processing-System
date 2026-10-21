@@ -8,12 +8,11 @@ import os
 PROJECT_FOLDER = Path(__file__).resolve().parents[2]
 os.environ.setdefault("DOCTR_CACHE_DIR", str(PROJECT_FOLDER / ".doctr-cache"))
 
-# EasyOCR takes time to start.
-# I keep it as None first, then create it once only when OCR is really needed.
-easyocr_reader = None
+# Model instances take time to start, so each is created once per device and cached.
+easyocr_readers = {}
 paddle_ocr = {}
-rapidocr_reader = None
-doctr_predictor = None
+rapidocr_readers = {}
+doctr_predictors = {}
 tesseract_available = False
 tesseract_languages = None
 
@@ -27,58 +26,81 @@ IMAGE_PREPROCESSING_MODES = [
 ]
 
 
-def get_easyocr_reader():
-    global easyocr_reader
+def get_easyocr_reader(device="cpu"):
+    global easyocr_readers
 
-    if easyocr_reader is None:
+    if device not in easyocr_readers:
         import easyocr
 
-        # gpu=False means this will run on a normal CPU.
-        easyocr_reader = easyocr.Reader(["en", "hi"], gpu=False)
+        # gpu=False runs on CPU; passing the device name directly ("mps"/"cuda")
+        # is more deterministic than gpu=True, which only auto-resolves to CUDA.
+        easyocr_readers[device] = easyocr.Reader(["en", "hi"], gpu=False if device == "cpu" else device)
 
-    return easyocr_reader
+    return easyocr_readers[device]
 
 
-def get_paddle_ocr(language="en"):
+def get_paddle_ocr(language="en", device="cpu"):
     global paddle_ocr
 
-    if language not in paddle_ocr:
+    if device == "mps":
+        raise ValueError("PaddleOCR has no Apple GPU (Metal/MPS) backend.")
+
+    cache_key = (language, device)
+
+    if cache_key not in paddle_ocr:
         try:
             from paddleocr import PaddleOCR
         except ImportError as error:
             raise RuntimeError("PaddleOCR is not installed. Install paddleocr first.") from error
 
-        paddle_ocr[language] = PaddleOCR(use_angle_cls=False, lang=language)
+        if device == "cpu":
+            paddle_ocr[cache_key] = PaddleOCR(use_angle_cls=False, lang=language)
+        else:
+            paddle_ocr[cache_key] = PaddleOCR(use_angle_cls=False, lang=language, device="gpu")
 
-    return paddle_ocr[language]
+    return paddle_ocr[cache_key]
 
 
-def get_rapidocr_reader():
-    global rapidocr_reader
+def get_rapidocr_reader(device="cpu"):
+    global rapidocr_readers
 
-    if rapidocr_reader is None:
+    if device not in rapidocr_readers:
         try:
             from rapidocr import RapidOCR
         except ImportError as error:
             raise RuntimeError("RapidOCR is not installed. Install rapidocr first.") from error
 
-        rapidocr_reader = RapidOCR()
+        if device == "cpu":
+            rapidocr_readers[device] = RapidOCR()
+        elif device == "mps":
+            rapidocr_readers[device] = RapidOCR(params={"EngineConfig.onnxruntime.use_coreml": True})
+        elif device == "cuda":
+            rapidocr_readers[device] = RapidOCR(params={"EngineConfig.onnxruntime.use_cuda": True})
+        else:
+            raise ValueError(f"Unknown device for RapidOCR: {device}")
 
-    return rapidocr_reader
+    return rapidocr_readers[device]
 
 
-def get_doctr_predictor():
-    global doctr_predictor
+def get_doctr_predictor(device="cpu"):
+    global doctr_predictors
 
-    if doctr_predictor is None:
+    if device not in doctr_predictors:
         try:
             from doctr.models import ocr_predictor
         except ImportError as error:
             raise RuntimeError("docTR is not installed. Install python-doctr[torch] first.") from error
 
-        doctr_predictor = ocr_predictor(pretrained=True)
+        predictor = ocr_predictor(pretrained=True)
 
-    return doctr_predictor
+        if device != "cpu":
+            import torch
+
+            predictor = predictor.to(torch.device(device))
+
+        doctr_predictors[device] = predictor
+
+    return doctr_predictors[device]
 
 
 def check_tesseract_available():
@@ -216,9 +238,9 @@ def get_ocr_image_path(image_path, preprocessing_mode, temporary_folder):
     return save_processed_image_to_temp_file(image_path, preprocessing_mode, temporary_folder)
 
 
-def extract_text_from_image_easyocr(image_path, preprocessing_mode="none"):
+def extract_text_from_image_easyocr(image_path, preprocessing_mode="none", device="cpu"):
     # Use OCR for image files like PNG and JPG.
-    reader = get_easyocr_reader()
+    reader = get_easyocr_reader(device)
 
     with TemporaryDirectory() as temporary_folder:
         ocr_image_path = get_ocr_image_path(image_path, preprocessing_mode, temporary_folder)
@@ -247,6 +269,7 @@ def extract_text_from_image_paddleocr(
     image_path,
     preprocessing_mode="none",
     languages=None,
+    device="cpu",
 ):
     # Extract text using PaddleOCR.
     text_lines = []
@@ -258,7 +281,7 @@ def extract_text_from_image_paddleocr(
 
         for language in languages:
             try:
-                paddle = get_paddle_ocr(language)
+                paddle = get_paddle_ocr(language, device)
                 results = paddle.ocr(str(ocr_image_path))
                 text_lines.extend(extract_text_lines_from_paddle_results(results))
             except Exception as error:
@@ -272,9 +295,9 @@ def extract_text_from_image_paddleocr(
     raise RuntimeError(f"PaddleOCR failed: {'; '.join(errors)}")
 
 
-def extract_text_from_image_rapidocr(image_path, preprocessing_mode="none"):
+def extract_text_from_image_rapidocr(image_path, preprocessing_mode="none", device="cpu"):
     # RapidOCR uses compact ONNX models and runs efficiently on CPU.
-    reader = get_rapidocr_reader()
+    reader = get_rapidocr_reader(device)
 
     with TemporaryDirectory() as temporary_folder:
         ocr_image_path = get_ocr_image_path(image_path, preprocessing_mode, temporary_folder)
@@ -284,14 +307,14 @@ def extract_text_from_image_rapidocr(image_path, preprocessing_mode="none"):
     return "\n".join(text_lines)
 
 
-def extract_text_from_image_doctr(image_path, preprocessing_mode="none"):
+def extract_text_from_image_doctr(image_path, preprocessing_mode="none", device="cpu"):
     # docTR combines document text detection and recognition using PyTorch.
     try:
         from doctr.io import DocumentFile
     except ImportError as error:
         raise RuntimeError("docTR is not installed. Install python-doctr[torch] first.") from error
 
-    predictor = get_doctr_predictor()
+    predictor = get_doctr_predictor(device)
 
     with TemporaryDirectory() as temporary_folder:
         ocr_image_path = get_ocr_image_path(image_path, preprocessing_mode, temporary_folder)
@@ -349,10 +372,11 @@ def extract_text_from_image(
     model_name="easyocr",
     preprocessing_mode="none",
     languages=None,
+    device="cpu",
 ):
     # Default image OCR entry point used by text_extractor.py.
     if model_name == "easyocr":
-        return extract_text_from_image_easyocr(image_path, preprocessing_mode)
+        return extract_text_from_image_easyocr(image_path, preprocessing_mode, device=device)
 
     if model_name == "tesseract":
         return extract_text_from_image_tesseract(image_path, preprocessing_mode)
@@ -362,13 +386,14 @@ def extract_text_from_image(
             image_path,
             preprocessing_mode,
             languages=languages,
+            device=device,
         )
 
     if model_name == "rapidocr":
-        return extract_text_from_image_rapidocr(image_path, preprocessing_mode)
+        return extract_text_from_image_rapidocr(image_path, preprocessing_mode, device=device)
 
     if model_name == "doctr":
-        return extract_text_from_image_doctr(image_path, preprocessing_mode)
+        return extract_text_from_image_doctr(image_path, preprocessing_mode, device=device)
 
     raise ValueError(f"Unknown OCR model: {model_name}")
 

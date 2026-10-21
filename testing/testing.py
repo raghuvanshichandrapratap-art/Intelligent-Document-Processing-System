@@ -31,6 +31,7 @@ from Backend.extractors.document_classification import (
 from Backend.extractors.field_mapper import extract_field_values_using_schema
 from Backend.extractors.validation import validate_extracted_fields
 from testing.reporting import (
+    get_document_outputs_folder,
     outputs_folder,
     save_aadhaar_json_file,
     save_accuracy_excel,
@@ -1715,11 +1716,13 @@ def process_image_with_model(
     fallback_extractor,
     make_fallback_classification,
     ocr_languages=None,
+    device="cpu",
 ):
     text = extract_text_from_image(
         image_path,
         model_name=model_name,
         languages=ocr_languages,
+        device=device,
     )
     return process_text_for_document(
         text,
@@ -1729,40 +1732,44 @@ def process_image_with_model(
     )
 
 
-def process_aadhaar_image_with_model(image_path, model_name):
+def process_aadhaar_image_with_model(image_path, model_name, device="cpu"):
     return process_image_with_model(
         image_path,
         model_name,
         extract_aadhaar_fields_from_text,
         make_aadhaar_classification,
+        device=device,
     )
 
 
-def process_pan_image_with_model(image_path, model_name):
+def process_pan_image_with_model(image_path, model_name, device="cpu"):
     return process_image_with_model(
         image_path,
         model_name,
         extract_pan_fields_from_text,
         lambda _document_type: make_pan_classification(),
+        device=device,
     )
 
 
-def process_passbook_image_with_model(image_path, model_name):
+def process_passbook_image_with_model(image_path, model_name, device="cpu"):
     return process_image_with_model(
         image_path,
         model_name,
         extract_passbook_fields_from_text,
         lambda _document_type: make_passbook_classification(),
+        device=device,
     )
 
 
-def process_invoice_image_with_model(image_path, model_name):
+def process_invoice_image_with_model(image_path, model_name, device="cpu"):
     return process_image_with_model(
         image_path,
         model_name,
         extract_invoice_fields_from_text,
         lambda _document_type: make_invoice_classification(),
         ocr_languages=("en",),
+        device=device,
     )
 
 
@@ -1828,6 +1835,16 @@ def convert_pdf_to_page_images(pdf_path, temporary_folder, dpi=150):
     return image_paths
 
 
+def load_existing_model_outputs(json_path):
+    if not json_path.is_file():
+        return {}
+    try:
+        with json_path.open("r", encoding="utf-8") as f:
+            return json.load(f).get("models", {})
+    except Exception:
+        return {}
+
+
 def process_document_image_folder(
     document_name,
     images_folder,
@@ -1836,7 +1853,7 @@ def process_document_image_folder(
     excel_file_name,
     model_scope=MODEL_SCOPE_ALL,
 ):
-    model_names = choose_models(
+    run_model_names = choose_models(
         get_available_ocr_models(),
         get_vision_llm_models(),
         model_scope,
@@ -1846,15 +1863,15 @@ def process_document_image_folder(
 
     for image_path in list_document_images(images_folder):
         ground_truth_path, ground_truth = load_ground_truth_for_image(image_path, ground_truth_folder)
-        model_outputs = {}
         document_side = get_document_image_side(document_name, image_path)
-        excel_row = {
-            "image address": str(image_path),
-            "document side": document_side,
-            "image quality category": get_image_quality_category(image_path),
-        }
 
-        for model_name in model_names:
+        json_output_path = (
+            get_document_outputs_folder(document_name, "image")
+            / f"{image_path.stem}_{document_name}_output.json"
+        )
+        model_outputs = load_existing_model_outputs(json_output_path)
+
+        for model_name in run_model_names:
             started_at = time.perf_counter()
 
             try:
@@ -1872,28 +1889,35 @@ def process_document_image_folder(
                     "raw_text": model_result.get("raw_text", ""),
                     "processing_time_seconds": processing_time_seconds,
                 }
-                excel_row[model_name] = comparison["accuracy_percent"]
-                excel_row[f"{model_name} processing time (seconds)"] = processing_time_seconds
-                excel_row.setdefault("__field_results", {})[model_name] = comparison["field_results"]
-                excel_row.setdefault("__model_failed", {})[model_name] = False
-                excel_row.setdefault("__model_complete", {})[model_name] = (
-                    comparison["total_fields"] > 0
-                    and comparison["matched_fields"] == comparison["total_fields"]
-                )
             except Exception as error:
-                comparison = compare_with_ground_truth({}, ground_truth)
-                processing_time_seconds = round(time.perf_counter() - started_at, 4)
-                model_outputs[model_name] = {
-                    "extracted_data": {},
-                    "comparison_with_ground_truth": make_readable_comparison(comparison),
-                    "error": str(error),
-                    "processing_time_seconds": processing_time_seconds,
-                }
-                excel_row[model_name] = comparison["accuracy_percent"]
-                excel_row[f"{model_name} processing time (seconds)"] = processing_time_seconds
-                excel_row.setdefault("__field_results", {})[model_name] = comparison["field_results"]
-                excel_row.setdefault("__model_failed", {})[model_name] = True
-                excel_row.setdefault("__model_complete", {})[model_name] = False
+                existing = model_outputs.get(model_name, {})
+                if existing and not existing.get("error"):
+                    # Keep the previously successful result rather than overwriting with an error.
+                    pass
+                else:
+                    comparison = compare_with_ground_truth({}, ground_truth)
+                    processing_time_seconds = round(time.perf_counter() - started_at, 4)
+                    model_outputs[model_name] = {
+                        "extracted_data": {},
+                        "comparison_with_ground_truth": make_readable_comparison(comparison),
+                        "error": str(error),
+                        "processing_time_seconds": processing_time_seconds,
+                    }
+
+        excel_row = {
+            "image address": str(image_path),
+            "document side": document_side,
+            "image quality category": get_image_quality_category(image_path),
+        }
+        for model_name, output in model_outputs.items():
+            comparison_data = output.get("comparison_with_ground_truth", {})
+            excel_row[model_name] = comparison_data.get("accuracy_percent", 0)
+            excel_row[f"{model_name} processing time (seconds)"] = output.get("processing_time_seconds", 0)
+            excel_row.setdefault("__field_results", {})[model_name] = comparison_data.get("fields", {})
+            excel_row.setdefault("__model_failed", {})[model_name] = bool(output.get("error"))
+            total = comparison_data.get("total_fields", 0)
+            matched = comparison_data.get("matched_fields", 0)
+            excel_row.setdefault("__model_complete", {})[model_name] = total > 0 and matched == total
 
         final_json = {
             "image": {
@@ -1915,9 +1939,17 @@ def process_document_image_folder(
         )
         excel_rows.append(excel_row)
 
+    _meta_keys = {"image address", "document side", "image quality category", "__field_results", "__model_failed", "__model_complete"}
+    all_model_names = list(dict.fromkeys(
+        name
+        for row in excel_rows
+        for name in row
+        if name not in _meta_keys and not name.endswith(" processing time (seconds)")
+    ))
+
     excel_output = save_accuracy_excel(
         excel_rows,
-        model_names,
+        all_model_names,
         file_name=excel_file_name,
         output_subfolder=document_name,
         output_format="image",
