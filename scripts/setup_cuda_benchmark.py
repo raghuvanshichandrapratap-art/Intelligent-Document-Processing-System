@@ -94,8 +94,15 @@ def ensure_torch_sees_cuda(cuda_version):
     # --reinstall-package is required: `uv pip install torch` alone is a no-op
     # when any torch build is already installed (even a CPU-only one), since
     # the bare "torch" requirement is already satisfied regardless of which
-    # index it originally came from.
-    run(["uv", "pip", "install", "torch", "--index-url", index_url, "--reinstall-package", "torch"])
+    # index it originally came from. --refresh-package additionally bypasses
+    # uv's cache, since --reinstall-package alone can still be served a stale
+    # cached wheel from an earlier (e.g. interrupted) install attempt.
+    run([
+        "uv", "pip", "install", "torch",
+        "--index-url", index_url,
+        "--reinstall-package", "torch",
+        "--refresh-package", "torch",
+    ])
 
     ok, stdout, stderr = run_python("import torch; print(torch.cuda.is_available())")
 
@@ -111,7 +118,7 @@ def ensure_torch_sees_cuda(cuda_version):
 def install_onnxruntime_gpu():
     print("\n=== Installing onnxruntime-gpu (for RapidOCR on CUDA) ===")
     run(["uv", "pip", "uninstall", "onnxruntime"], check=False)
-    run(["uv", "pip", "install", "onnxruntime-gpu"])
+    run(["uv", "pip", "install", "onnxruntime-gpu", "--refresh-package", "onnxruntime-gpu"])
 
 
 def install_paddlepaddle_gpu(cuda_version):
@@ -126,16 +133,25 @@ def install_paddlepaddle_gpu(cuda_version):
         return
 
     run(["uv", "pip", "uninstall", "paddlepaddle"], check=False)
+    run(["uv", "pip", "uninstall", "paddlepaddle-gpu"], check=False)
     index_url = f"https://www.paddlepaddle.org.cn/packages/stable/cu{channel.replace('.', '')}/"
 
+    # --refresh-package is required here, confirmed by hitting it directly: uv
+    # can silently serve a stale cached wheel even across uninstall/reinstall
+    # cycles, which looks identical to a genuinely CPU-only build (same
+    # version, same filename) until you inspect paddle.version.show().
     result = run(
-        ["uv", "pip", "install", f"paddlepaddle-gpu=={PADDLE_VERSION}", "-i", index_url],
+        [
+            "uv", "pip", "install", f"paddlepaddle-gpu=={PADDLE_VERSION}",
+            "-i", index_url,
+            "--refresh-package", "paddlepaddle-gpu",
+        ],
         check=False,
     )
 
     if result.returncode != 0:
         print(f"paddlepaddle-gpu=={PADDLE_VERSION} isn't available on that channel yet, trying latest.")
-        run(["uv", "pip", "install", "paddlepaddle-gpu", "-i", index_url])
+        run(["uv", "pip", "install", "paddlepaddle-gpu", "-i", index_url, "--refresh-package", "paddlepaddle-gpu"])
 
 
 def verify_setup():
